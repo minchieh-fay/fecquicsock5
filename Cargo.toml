@@ -1,0 +1,16 @@
+[package]
+name = "quic-fec-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+quinn = "0.11"
+reed-solomon-erasure = "6"
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+rcgen = "0.13"
