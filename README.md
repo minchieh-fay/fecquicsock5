@@ -77,6 +77,10 @@ services:
     image: docker.1panel.live/library/debian:bookworm-slim
     container_name: quic-fec-proxy-a
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
     command:
       - /opt/qfp/quic-fec-proxy
       - client
@@ -108,6 +112,10 @@ services:
     image: debian:bookworm-slim
     container_name: quic-fec-proxy-b
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
     command:
       - /opt/qfp/quic-fec-proxy
       - server
@@ -192,6 +200,7 @@ curl --proxy 'socks5h://www.feyon.vip:18086' \
 - 如果旧 QUIC 连接失效，A 会对开流和远端确认设置超时；远端确认超时后，程序会重建隧道并重试一次。可在 A 日志中查找 `重建隧道后重试`。
 - 若 A 只有 `SOCKS5 请求已解析`，没有 `QUIC 代理流已创建`，检查 A 到 B 的 QUIC/UDP 路径和 A 日志中的流申请错误。
 - 若 A 有流创建但 B 没有对应目标日志，检查旧隧道状态、B 服务进程、UDP 4433 和 FEC 参数是否一致。
+- Compose 部署建议将 `nofile` 软限制设为 65536、硬限制设为 524288。TCP 转发正确处理半关闭；目标先结束响应时会关闭代理流并释放 socket。
 - 若 B 显示 TCP 连接成功但应用仍失败，再检查 B 到目标网站的出口连接和 TCP 双向转发日志。
 - DDNS 域名解析不正确时，先确认 DNS 当前答案，再排查 SOCKS 或 QUIC；域名缓存可能让旧地址在 TTL 到期前继续生效。
 

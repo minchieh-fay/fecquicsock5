@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, copy},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::mpsc,
 };
@@ -409,9 +409,8 @@ async fn handle_remote(
     send.write_u8(0).await?;
     send.flush().await?;
     let (mut target_read, mut target_write) = target.into_split();
-    let upstream = copy(&mut recv, &mut target_write);
-    let downstream = copy(&mut target_read, &mut send);
-    tokio::try_join!(upstream, downstream)?;
+    // 中文注释：响应结束时释放仍在等待客户端数据的目标连接。
+    relay_bidirectional(&mut recv, &mut send, &mut target_read, &mut target_write).await?;
     let _ = send.finish();
     Ok(())
 }
@@ -486,6 +485,37 @@ async fn handle_remote_udp(send: quinn::SendStream, mut recv: quinn::RecvStream)
     Ok(())
 }
 
+/// 双向转发两个异步端点，并在响应方向结束后释放尚未结束的请求方向。
+async fn relay_bidirectional<LeftRead, LeftWrite, RightRead, RightWrite>(
+    left_read: &mut LeftRead,
+    left_write: &mut LeftWrite,
+    right_read: &mut RightRead,
+    right_write: &mut RightWrite,
+) -> io::Result<()>
+where
+    LeftRead: AsyncRead + Unpin,
+    LeftWrite: AsyncWrite + Unpin,
+    RightRead: AsyncRead + Unpin,
+    RightWrite: AsyncWrite + Unpin,
+{
+    // step.1 并发转发请求和响应，保留正常的请求半关闭行为
+    let left_to_right = copy(left_read, right_write);
+    let right_to_left = copy(right_read, left_write);
+    tokio::pin!(left_to_right);
+    tokio::pin!(right_to_left);
+    // step.2 请求先结束时继续等待响应，响应先结束时释放整个代理会话
+    tokio::select! {
+        result = &mut left_to_right => {
+            result?;
+            right_to_left.await?;
+        }
+        result = &mut right_to_left => {
+            result?;
+        }
+    }
+    Ok(())
+}
+
 /// 并发复制本地 TCP 与 QUIC 流的两个方向。
 async fn relay(
     socket: TcpStream,
@@ -494,9 +524,59 @@ async fn relay(
 ) -> Result<()> {
     // step.1 同时转发上行请求与下行响应字节
     let (mut local_read, mut local_write) = socket.into_split();
-    let up = copy(&mut local_read, &mut send);
-    let down = copy(&mut recv, &mut local_write);
-    tokio::try_join!(up, down)?;
+    // 中文注释：响应流关闭后通知本地客户端并结束未完成的上行读取。
+    relay_bidirectional(&mut local_read, &mut local_write, &mut recv, &mut send).await?;
     let _ = send.finish();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relay_bidirectional;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex, split};
+
+    /// 验证目标先结束响应时会关闭本地写端并释放未完成的请求方向。
+    #[tokio::test]
+    async fn response_eof_closes_relay_when_request_side_stays_open() {
+        // step.1 创建代理两侧的异步字节流并启动双向转发
+        let (mut client, proxy_local) = duplex(64);
+        let (proxy_remote, target) = duplex(64);
+        let (mut local_read, mut local_write) = split(proxy_local);
+        let (mut remote_read, mut remote_write) = split(proxy_remote);
+        let relay_task = tokio::spawn(async move {
+            relay_bidirectional(
+                &mut local_read,
+                &mut local_write,
+                &mut remote_read,
+                &mut remote_write,
+            )
+            .await
+        });
+        // step.2 目标读取请求后返回响应，并先关闭响应写端
+        let (mut target_read, mut target_write) = split(target);
+        let target_task = tokio::spawn(async move {
+            let mut request = [0; 7];
+            target_read.read_exact(&mut request).await?;
+            assert_eq!(&request, b"request");
+            target_write.write_all(b"response").await?;
+            target_write.shutdown().await
+        });
+        client.write_all(b"request").await.unwrap();
+        // step.3 客户端仍保持请求写端打开时，也应收到响应 EOF 并释放转发任务
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("响应 EOF 未及时传递")
+        .unwrap();
+        assert_eq!(response, b"response");
+        target_task.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay_task)
+            .await
+            .expect("转发任务未释放")
+            .unwrap()
+            .unwrap();
+    }
 }
